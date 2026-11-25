@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>邮品目录库 · Go 缓冲池观察台</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+<header>
+  <div>
+    <h1>邮品目录库 · 数据库缓冲池观察台</h1>
+    <div class="subtitle">
+      固定种子混合负载：热点邮品页、周期性全表统计扫描、随机点查与 8 个并发查询。
+      淘汰核心为可配 K 的 LRU-K、幽灵历史、老少两段、顺序预读、脏页刷盘队列和运行时缩容。
+    </div>
+  </div>
+  <div id="healthPill" class="status-pill">正在加载…</div>
+</header>
+
+<div class="container">
+  <section class="controls">
+    <div class="control">
+      <label>目标池大小（页，可运行中调整）</label>
+      <input id="capacity" type="number" min="1" step="1" />
+    </div>
+    <div class="control">
+      <label>LRU-K 的 K</label>
+      <input id="k" type="number" min="1" max="32" step="1" />
+    </div>
+    <div class="control">
+      <label>同事务同页去重间隔 ms</label>
+      <input id="dedup" type="number" min="0" step="10" />
+    </div>
+    <div class="control">
+      <label>幽灵历史保留 ms</label>
+      <input id="ghostTtl" type="number" min="0" step="1000" />
+    </div>
+    <div class="control">
+      <label>老段停留多久后可升级 ms</label>
+      <input id="oldAge" type="number" min="0" step="100" />
+    </div>
+    <div class="control">
+      <label>预读页数 / 触发连续次数</label>
+      <div style="display:flex;gap:6px">
+        <input id="prefetchDepth" type="number" min="0" max="32" />
+        <input id="seqThreshold" type="number" min="2" max="16" />
+      </div>
+    </div>
+    <div class="control">
+      <label>未用预读回收 TTL ms</label>
+      <input id="prefetchTtl" type="number" min="0" step="100" />
+    </div>
+    <div class="control">
+      <label>配置操作</label>
+      <div class="btn-row">
+        <button id="applyConfig">应用 K/间隔</button>
+        <button id="resizeBtn" class="secondary">热调容量</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="kpis" id="kpis"></section>
+
+  <main class="grid">
+    <section class="card span-8">
+      <h2>
+        <span>命中率随时间曲线</span>
+        <span class="note">每 0.5s 采样；蓝线为窗口命中率，绿线为累计命中率</span>
+      </h2>
+      <div class="chart"><canvas id="hitChart"></canvas></div>
+      <div class="legend">
+        <span><i style="background:#38bdf8"></i>窗口命中率</span>
+        <span><i style="background:#34d399"></i>累计命中率</span>
+        <span id="sampleHint" class="small"></span>
+      </div>
+    </section>
+
+    <section class="card span-4">
+      <h2><span>当前淘汰候选</span><span id="candidateTier" class="tag candidate">victim heap root</span></h2>
+      <div id="candidate"></div>
+    </section>
+
+    <section class="card span-7">
+      <h2>
+        <span>替换方式命中率对比</span>
+        <span class="note">同一固定 trace、同一容量；OPT 为预知未来上界</span>
+      </h2>
+      <div class="compare-grid">
+        <div class="chart tall"><canvas id="compareChart"></canvas></div>
+        <div id="compareTable"></div>
+      </div>
+      <div class="legend">
+        <span><i style="background:#fbbf24"></i>OPT</span>
+        <span><i style="background:#fb7185"></i>LRU-K</span>
+        <span><i style="background:#38bdf8"></i>LRU</span>
+        <span><i style="background:#a78bfa"></i>Clock</span>
+      </div>
+    </section>
+
+    <section class="card span-5">
+      <h2><span>按查询类型看池子占用</span><span class="note">FetchClass attribution</span></h2>
+      <div id="usage"></div>
+    </section>
+
+    <section class="card span-8">
+      <h2><span>缓存页明细与最近访问时间</span><span class="note">分页覆盖池内每一页，避免几十万行一次塞入页面</span></h2>
+      <div class="filters">
+        <input id="frameSearch" placeholder="精确页 ID，如 123" />
+        <select id="classFilter">
+          <option value="all">全部查询类型</option>
+          <option value="hotspot">hotspot 热点</option>
+          <option value="scan">scan 全表扫描</option>
+          <option value="random">random 随机点查</option>
+          <option value="mixed">mixed 混合</option>
+        </select>
+        <select id="segmentFilter">
+          <option value="all">全部段</option>
+          <option value="old">old 老段</option>
+          <option value="young">young 少段</option>
+        </select>
+        <button id="filterBtn" class="secondary">筛选</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+          <tr>
+            <th>页 ID</th><th>读入类型</th><th>段</th><th>有效访问</th>
+            <th>最近访问（距今 ms，新→旧）</th><th>标记</th><th>LSN/版本</th>
+          </tr>
+          </thead>
+          <tbody id="frameRows"></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button id="prevPage" class="secondary">上一页</button>
+        <span id="pageInfo"></span>
+        <button id="nextPage" class="secondary">下一页</button>
+        <select id="pageSize">
+          <option>50</option><option selected>100</option><option>200</option>
+        </select>
+      </div>
+    </section>
+
+    <section class="card span-4">
+      <h2><span>脏页与刷盘队列</span><span id="dirtySummary" class="note"></span></h2>
+      <div class="table-wrap" style="max-height:492px">
+        <table>
+          <thead><tr><th>#</th><th>页</th><th>脏时长</th><th>LSN</th><th>来源</th></tr></thead>
+          <tbody id="dirtyRows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card span-5">
+      <h2><span>淘汰幽灵历史（短时间读回可续用）</span><span id="ghostSummary" class="note"></span></h2>
+      <div class="table-wrap" style="max-height:260px">
+        <table>
+          <thead><tr><th>页</th><th>访问数</th><th>淘汰于</th><th>保留的访问年龄 ms</th></tr></thead>
+          <tbody id="ghostRows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card span-7">
+      <h2><span>内容一致性 / 交付校验</span>
+        <span>
+          <button id="liveCheck" class="secondary">校验干净页=磁盘页</button>
+          <button id="rerunVerify" class="secondary">重跑全量离线校验</button>
+        </span>
+      </h2>
+      <div id="verifySummary" class="metric-line"></div>
+      <div id="verifyReport" class="report-box" style="margin-top:10px"></div>
+    </section>
+  </main>
+</div>
+<div id="toast" class="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
